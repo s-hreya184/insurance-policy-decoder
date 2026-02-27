@@ -2,23 +2,23 @@
 
 AI-powered system that simplifies complex Indian insurance policies into actionable financial insights.
 
-## 🚨 Problem
+## Problem
 68% of Indian policyholders do not fully understand policy documents, leading to claim rejections and financial loss.
 
-## ✅ Features
+## Features
 - Policy Risk Score
 - Waiting Period Detection
 - Treatment Exclusions
 - Hidden Coverage Limits
 - Out-of-pocket Cost Estimation
 
-## ⚙️ Tech Stack
+## Tech Stack
 - Python
 - Streamlit
 - LLM (Llama3 via Ollama)
 - NLP Processing
 
-## 🚀 Run Locally
+## Run Locally
 
 Install dependencies:
 
@@ -31,3 +31,7 @@ ollama run llama3
 Start app:
 
 streamlit run app.py
+
+## Collaborators
+Shreya Babar
+Rutuja Zawar
