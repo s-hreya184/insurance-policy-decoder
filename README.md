@@ -1,4 +1,4 @@
-# 🛡 Insurance Policy Decoder
+LegalX - Legal Summarizer
 
 AI-powered system that simplifies complex Indian insurance policies into actionable financial insights.
 
