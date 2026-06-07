@@ -22,7 +22,7 @@ def _client() -> Groq:
 
 
 MAX_SINGLE = 6000
-MODEL      = "llama3-8b-8192"   # free tier; swap to llama3-70b-8192 for better quality
+MODEL      = "llama-3.1-8b-instant"   # free tier; swap to llama-3.3-70b-versatile for better quality
 
 
 def call_llm(prompt: str, timeout: int = 180) -> str:
