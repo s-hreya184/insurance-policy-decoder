@@ -1,24 +1,21 @@
 """
-rag.py — RAG pipeline using Groq embeddings + ChromaDB
-Embedding model: nomic-embed-text (via Groq)
-Vector store: ChromaDB (in-memory, per session)
+rag.py — RAG pipeline using Groq embeddings + pure numpy vector store
+No ChromaDB — avoids Python 3.14 / protobuf compatibility issues on Streamlit Cloud
 """
 
 import hashlib
+import math
 import re
-from typing import Optional
 
-import chromadb
 import streamlit as st
 from groq import Groq
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
-EMBED_MODEL     = "nomic-embed-text-v1_5"   # Groq's hosted embedding model
-CHUNK_SIZE      = 800
-CHUNK_OVERLAP   = 120
-TOP_K           = 6
-COLLECTION_NAME = "legalx_policies"
+EMBED_MODEL   = "nomic-embed-text-v1_5"
+CHUNK_SIZE    = 800
+CHUNK_OVERLAP = 120
+TOP_K         = 6
 
 
 # ── Groq client ────────────────────────────────────────────────────────────────
@@ -31,29 +28,32 @@ def _client() -> Groq:
     return Groq(api_key=api_key)
 
 
-# ── ChromaDB (session-scoped via st.session_state) ────────────────────────────
+# ── Pure-python cosine similarity vector store ────────────────────────────────
 
-def _get_collection():
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    dot   = sum(x * y for x, y in zip(a, b))
+    mag_a = math.sqrt(sum(x * x for x in a))
+    mag_b = math.sqrt(sum(x * x for x in b))
+    if mag_a == 0 or mag_b == 0:
+        return 0.0
+    return dot / (mag_a * mag_b)
+
+
+def _get_store() -> dict:
     """
-    Keep one ChromaDB client + collection per Streamlit session.
-    In-memory is fine — documents are re-ingested per session anyway.
+    Session-scoped in-memory vector store.
+    Structure: { doc_id: { "chunks": [...], "embeddings": [[...], ...] } }
     """
-    if "chroma_collection" not in st.session_state:
-        client = chromadb.Client()
-        st.session_state["chroma_collection"] = client.get_or_create_collection(
-            name=COLLECTION_NAME,
-            metadata={"hnsw:space": "cosine"},
-        )
-    return st.session_state["chroma_collection"]
+    if "vector_store" not in st.session_state:
+        st.session_state["vector_store"] = {}
+    return st.session_state["vector_store"]
 
 
 # ── Groq embeddings ────────────────────────────────────────────────────────────
 
 def _embed(texts: list[str]) -> list[list[float]]:
-    """Embed a list of texts using Groq's nomic-embed-text model."""
     client = _client()
     embeddings = []
-    # Groq embedding API accepts one text at a time
     for text in texts:
         try:
             response = client.embeddings.create(
@@ -99,7 +99,6 @@ def _semantic_chunk(text: str) -> list[str]:
     if current:
         chunks.append(current)
 
-    # Add overlap
     overlapped: list[str] = []
     for i, chunk in enumerate(chunks):
         if i > 0:
@@ -113,16 +112,11 @@ def _semantic_chunk(text: str) -> list[str]:
 # ── Public API ─────────────────────────────────────────────────────────────────
 
 def ingest_document(text: str, doc_id: str) -> dict:
-    """
-    Chunk, embed, and store a document in ChromaDB.
-    Skips re-ingestion if the same doc_id is already in the collection.
-    """
-    col = _get_collection()
+    store = _get_store()
 
-    # Check if already ingested this session
-    existing = col.get(where={"doc_id": doc_id})
-    if existing["ids"]:
-        return {"doc_id": doc_id, "chunk_count": len(existing["ids"]), "cached": True}
+    # Already ingested this session
+    if doc_id in store:
+        return {"doc_id": doc_id, "chunk_count": len(store[doc_id]["chunks"]), "cached": True}
 
     chunks = _semantic_chunk(text)
     if not chunks:
@@ -130,38 +124,27 @@ def ingest_document(text: str, doc_id: str) -> dict:
 
     embeddings = _embed(chunks)
 
-    ids       = [f"{doc_id}_chunk_{i}" for i in range(len(chunks))]
-    metadatas = [{"doc_id": doc_id, "chunk_index": i} for i in range(len(chunks))]
-
-    col.add(
-        ids=ids,
-        embeddings=embeddings,
-        documents=chunks,
-        metadatas=metadatas,
-    )
-
+    store[doc_id] = {"chunks": chunks, "embeddings": embeddings}
     return {"doc_id": doc_id, "chunk_count": len(chunks), "cached": False}
 
 
 def retrieve(query: str, doc_id: str, top_k: int = TOP_K) -> list[str]:
-    """Retrieve the most relevant chunks for a query from a specific document."""
-    col = _get_collection()
-    query_embedding = _embed([query])[0]
-
-    total = col.count()
-    if total == 0:
+    store = _get_store()
+    if doc_id not in store:
         return []
 
-    results = col.query(
-        query_embeddings=[query_embedding],
-        n_results=min(top_k, total),
-        where={"doc_id": doc_id},
-        include=["documents", "distances"],
-    )
+    query_embedding = _embed([query])[0]
+    chunks     = store[doc_id]["chunks"]
+    embeddings = store[doc_id]["embeddings"]
 
-    return results["documents"][0] if results["documents"] else []
+    scored = [
+        (_cosine_similarity(query_embedding, emb), chunk)
+        for emb, chunk in zip(embeddings, chunks)
+    ]
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    return [chunk for _, chunk in scored[:top_k]]
 
 
 def doc_id_from_bytes(file_bytes: bytes) -> str:
-    """Stable document ID from file content hash."""
     return hashlib.sha256(file_bytes).hexdigest()[:16]
