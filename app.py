@@ -1160,11 +1160,7 @@ rag_ready = st.session_state.get("rag_ready", False)
 if not rag_ready:
     rag_err = st.session_state.get("rag_error", "")
     if rag_err:
-        st.warning(
-            f"Q&A is unavailable: {rag_err}\n\n"
-            "Make sure Ollama is running and you have pulled the embedding model:\n"
-            "`ollama pull nomic-embed-text`"
-        )
+        st.warning(f"Q&A is unavailable: {rag_err}")
     else:
         st.info("Semantic index is still building. Scroll up to check progress.")
 else:
