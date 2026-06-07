@@ -5,6 +5,8 @@ from pdf_utils import extract_text
 from text_utils import chunk_text
 from llm import insurance_decoder
 from risk_engine import calculate_risk_score, AVG_TREATMENT_COST
+from rag import ingest_document, retrieve, doc_id_from_bytes
+from rag_qa import answer_question, suggest_questions
 
 # Page config
 st.set_page_config(
@@ -25,7 +27,7 @@ html, body,
 [data-testid="stMain"],
 section.main,
 .main .block-container {
-    background-color: #0a0a0f !important;
+    background-color: #0a0a0f !important;   
 }
 
 [data-testid="stSidebar"] { background: #0e0e16 !important; }
@@ -597,10 +599,18 @@ if not uploaded_file:
     """, unsafe_allow_html=True)
     st.stop()
 
+# Read bytes once (needed for RAG doc_id + text extraction)
+file_bytes = uploaded_file.read()
+doc_id     = doc_id_from_bytes(file_bytes)
+
+# Reset stream so pdfplumber can read it
+import io
+uploaded_file_io = io.BytesIO(file_bytes)
+
 # Extract text
 with st.spinner("Reading policy document..."):
     try:
-        text = extract_text(uploaded_file)
+        text = extract_text(uploaded_file_io)
     except Exception as e:
         st.error(f"Could not read the PDF: {e}")
         st.stop()
@@ -610,6 +620,19 @@ if not text or len(text.strip()) < 200:
     st.stop()
 
 chunks = chunk_text(text, chunk_size=3000, overlap=200)
+
+# ── RAG ingestion (runs in background after extraction) ──────────────────────
+if "rag_ready" not in st.session_state or st.session_state.get("rag_doc_id") != doc_id:
+    st.session_state["rag_ready"]  = False
+    st.session_state["rag_doc_id"] = doc_id
+    try:
+        with st.spinner("Building semantic index for Q&A..."):
+            ingest_document(text, doc_id)
+            st.session_state["rag_ready"] = True
+    except Exception as e:
+        # RAG failure is non-fatal — analysis still works
+        st.session_state["rag_ready"] = False
+        st.session_state["rag_error"] = str(e)
 
 # LLM analysis
 all_alerts, waiting_periods, exclusions = [], [], []
@@ -830,7 +853,7 @@ with st.form("risk_form"):
         sum_insured = st.selectbox(
             "Your Policy's Total Cover",
             options=[2_00_000, 3_00_000, 5_00_000, 10_00_000, 15_00_000, 25_00_000, 50_00_000],
-            default=[],
+            index=0,
             format_func=fmt_inr,
             help="The maximum amount your insurer will pay in a claim year."
         )
@@ -1002,6 +1025,218 @@ if submitted:
                 )
 
     st.markdown("<br>", unsafe_allow_html=True)
+
+# ── Step 3: RAG-powered Q&A ───────────────────────────────────────────────────
+
+st.markdown("""
+<style>
+.qa-header {
+    position: relative;
+    overflow: hidden;
+    background: linear-gradient(135deg, #0e1018 0%, #101420 50%, #0e1018 100%);
+    border: 1px solid #1e2840;
+    border-radius: 16px;
+    padding: 2.5rem 2.5rem;
+    margin: 3rem 0 1.8rem 0;
+}
+.qa-header::before {
+    content: '';
+    position: absolute;
+    top: -40px; left: -40px;
+    width: 240px; height: 240px;
+    border-radius: 50%;
+    background: radial-gradient(circle, rgba(91,141,239,0.12) 0%, transparent 70%);
+    pointer-events: none;
+}
+.qa-tag {
+    display: inline-block;
+    background: rgba(91,141,239,0.12);
+    border: 1px solid rgba(91,141,239,0.3);
+    border-radius: 20px;
+    padding: 4px 14px;
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: #88b0f0 !important;
+    font-family: 'JetBrains Mono', monospace !important;
+    margin-bottom: 1rem;
+    position: relative;
+    z-index: 1;
+}
+.qa-header h2 {
+    font-family: 'Inter', sans-serif !important;
+    font-size: 2rem !important;
+    font-weight: 700 !important;
+    color: #f5f0e8 !important;
+    margin: 0 0 0.6rem 0 !important;
+    line-height: 1.2;
+    position: relative;
+    z-index: 1;
+}
+.qa-header p {
+    color: #686888 !important;
+    font-size: 0.93rem !important;
+    margin: 0 !important;
+    line-height: 1.6;
+    max-width: 580px;
+    position: relative;
+    z-index: 1;
+}
+.qa-pill {
+    display: inline-block;
+    background: rgba(91,141,239,0.08);
+    border: 1px solid rgba(91,141,239,0.25);
+    border-radius: 20px;
+    padding: 6px 16px;
+    font-size: 0.82rem;
+    color: #88a8e0 !important;
+    cursor: pointer;
+    margin: 4px 4px 4px 0;
+    transition: background 0.15s, border-color 0.15s;
+}
+.qa-pill:hover {
+    background: rgba(91,141,239,0.18);
+    border-color: rgba(91,141,239,0.5);
+}
+.chat-bubble-user {
+    background: rgba(124,106,247,0.12);
+    border: 1px solid rgba(124,106,247,0.25);
+    border-radius: 12px 12px 4px 12px;
+    padding: 0.9rem 1.2rem;
+    margin: 0.6rem 0;
+    font-size: 0.9rem;
+    color: #d0c8ff !important;
+    text-align: right;
+    margin-left: 15%;
+}
+.chat-bubble-ai {
+    background: #13131e;
+    border: 1px solid #2a2a3d;
+    border-radius: 12px 12px 12px 4px;
+    padding: 0.9rem 1.2rem;
+    margin: 0.6rem 0;
+    font-size: 0.9rem;
+    color: #c8c8d8 !important;
+    line-height: 1.65;
+    margin-right: 15%;
+}
+.chat-bubble-ai strong { color: #e8e8f0 !important; }
+.rag-badge {
+    display: inline-block;
+    background: rgba(39,174,96,0.1);
+    border: 1px solid rgba(39,174,96,0.3);
+    border-radius: 6px;
+    padding: 2px 8px;
+    font-size: 0.65rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #60c880 !important;
+    font-family: 'JetBrains Mono', monospace !important;
+    margin-bottom: 0.5rem;
+}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<div class="qa-header">
+    <div class="qa-tag">Step 3 — Ask Your Policy</div>
+    <h2>Policy Q&amp;A</h2>
+    <p>
+        Ask anything about this policy in plain English. Answers are retrieved directly
+        from the document — not guessed.
+    </p>
+</div>
+""", unsafe_allow_html=True)
+
+# Initialise chat history
+if "chat_history" not in st.session_state or st.session_state.get("chat_doc_id") != doc_id:
+    st.session_state["chat_history"] = []
+    st.session_state["chat_doc_id"]  = doc_id
+
+rag_ready = st.session_state.get("rag_ready", False)
+
+if not rag_ready:
+    rag_err = st.session_state.get("rag_error", "")
+    if rag_err:
+        st.warning(
+            f"Q&A is unavailable: {rag_err}\n\n"
+            "Make sure Ollama is running and you have pulled the embedding model:\n"
+            "`ollama pull nomic-embed-text`"
+        )
+    else:
+        st.info("Semantic index is still building. Scroll up to check progress.")
+else:
+    # Suggested questions (only when no chat yet)
+    if not st.session_state["chat_history"]:
+        policy_summary = {
+            "waiting_periods": waiting_periods,
+            "co_payment": copayments,
+            "hidden_limits": hidden_limits,
+            "exclusions": exclusions,
+        }
+        suggestions = suggest_questions(policy_summary)
+        st.markdown(
+            "<div style='font-size:0.78rem;font-weight:600;letter-spacing:0.08em;"
+            "text-transform:uppercase;color:#6868a8;margin-bottom:0.6rem;"
+            "font-family:JetBrains Mono,monospace'>Suggested Questions</div>",
+            unsafe_allow_html=True,
+        )
+        cols = st.columns(2)
+        for idx, suggestion in enumerate(suggestions):
+            with cols[idx % 2]:
+                if st.button(suggestion, key=f"sug_{idx}", use_container_width=True):
+                    st.session_state["pending_question"] = suggestion
+
+    # Display chat history
+    for msg in st.session_state["chat_history"]:
+        if msg["role"] == "user":
+            st.markdown(
+                f'<div class="chat-bubble-user">{msg["content"]}</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                f'<div class="rag-badge">RAG · Retrieved from policy</div>'
+                f'<div class="chat-bubble-ai">{msg["content"]}</div>',
+                unsafe_allow_html=True,
+            )
+
+    # Input box
+    user_input = st.text_input(
+        "Ask a question about your policy",
+        value=st.session_state.pop("pending_question", ""),
+        placeholder="e.g. Does this policy cover maternity? What is the ICU room rent limit?",
+        label_visibility="collapsed",
+        key="qa_input",
+    )
+
+    col_ask, col_clear = st.columns([5, 1])
+    with col_ask:
+        ask_clicked = st.button("Ask", use_container_width=True, type="primary")
+    with col_clear:
+        if st.button("Clear", use_container_width=True):
+            st.session_state["chat_history"] = []
+            st.rerun()
+
+    if ask_clicked and user_input.strip():
+        question = user_input.strip()
+
+        with st.spinner("Retrieving relevant clauses and generating answer..."):
+            try:
+                chunks_retrieved = retrieve(question, doc_id)
+                answer = answer_question(
+                    question,
+                    chunks_retrieved,
+                    history=st.session_state["chat_history"],
+                )
+                st.session_state["chat_history"].append({"role": "user",      "content": question})
+                st.session_state["chat_history"].append({"role": "assistant", "content": answer})
+            except Exception as e:
+                st.error(f"Q&A failed: {e}")
+
+        st.rerun()
 
 # Footer
 st.markdown("""
