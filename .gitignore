@@ -5,5 +5,4 @@ __pycache__/
 *.pyc
 *.pyo
 *.log
-API KEY.txt
 .streamlit/secrets.toml

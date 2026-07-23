@@ -10,6 +10,7 @@ Stack:
 """
 
 import hashlib
+import os
 import streamlit as st
 
 from llama_index.core import VectorStoreIndex, StorageContext, Settings, Document
@@ -45,10 +46,14 @@ def _get_embed_model():
 
 
 def _get_llm():
-    try:
-        api_key = st.secrets["GROQ_API_KEY"]
-    except Exception:
-        raise RuntimeError("GROQ_API_KEY not found in Streamlit secrets.")
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        try:
+            api_key = st.secrets["GROQ_API_KEY"]
+        except Exception:
+            api_key = None
+    if not api_key:
+        raise RuntimeError("GROQ_API_KEY not found. Add it as a Replit Secret.")
     return GroqLLM(model=LLM_MODEL, api_key=api_key, temperature=0.05)
 
 

@@ -2,11 +2,11 @@ import re
 import time
 import streamlit as st
 from pdf_utils import extract_text
-from text_utils import chunk_text
+from text_utils import chunk_text, extract_relevant_text
 from llm import insurance_decoder
 from risk_engine import calculate_risk_score, AVG_TREATMENT_COST
 from rag import ingest_document, retrieve, doc_id_from_bytes
-from rag_qa import answer_question, suggest_questions
+from rag_qa import answer_question, suggest_questions, reset_chat_engine
 
 # Page config
 st.set_page_config(
@@ -599,8 +599,14 @@ if not uploaded_file:
     """, unsafe_allow_html=True)
     st.stop()
 
-# Read bytes once (needed for RAG doc_id + text extraction)
-file_bytes = uploaded_file.read()
+# Read bytes (needed for RAG doc_id + text extraction).
+# IMPORTANT: use getvalue(), not read(). Streamlit reruns the whole script on
+# every widget interaction (e.g. clicking "Ask"), and the same UploadedFile
+# object persists across reruns. .read() advances its internal pointer, so
+# on the 2nd+ rerun it returns b"" (pointer already at EOF), which breaks
+# text extraction and silently st.stop()s before the Q&A section ever runs.
+# .getvalue() always returns the full bytes regardless of pointer position.
+file_bytes = uploaded_file.getvalue()
 doc_id     = doc_id_from_bytes(file_bytes)
 
 # Reset stream so pdfplumber can read it
@@ -619,7 +625,10 @@ if not text or len(text.strip()) < 200:
     st.error("No readable text found. This may be a scanned PDF. Please use a text-based PDF.")
     st.stop()
 
-chunks = chunk_text(text, chunk_size=3000, overlap=200)
+filtered_text, stats = extract_relevant_text(text)
+
+chunks = chunk_text(filtered_text, chunk_size=3000, overlap=200)
+ingest_document(filtered_text, doc_id)
 
 # ── RAG ingestion (runs in background after extraction) ──────────────────────
 if "rag_ready" not in st.session_state or st.session_state.get("rag_doc_id") != doc_id:
@@ -627,7 +636,7 @@ if "rag_ready" not in st.session_state or st.session_state.get("rag_doc_id") != 
     st.session_state["rag_doc_id"] = doc_id
     try:
         with st.spinner("Building semantic index for Q&A..."):
-            ingest_document(text, doc_id)
+            ingest_document(filtered_text, doc_id)
             st.session_state["rag_ready"] = True
     except Exception as e:
         # RAG failure is non-fatal — analysis still works
@@ -635,73 +644,117 @@ if "rag_ready" not in st.session_state or st.session_state.get("rag_doc_id") != 
         st.session_state["rag_error"] = str(e)
 
 # LLM analysis
-all_alerts, waiting_periods, exclusions = [], [], []
-copayments, hidden_limits, llm_risk_scores = [], [], []
+# IMPORTANT: this calls the Groq API once per chunk, which is slow and rate
+# limited. Streamlit reruns this whole script on every widget interaction
+# (clicking "Ask", "Clear", a suggested question, etc.), so without caching,
+# every single click in the Q&A section below would silently re-trigger this
+# entire multi-call LLM analysis again before ever reaching the chat logic —
+# making the app look "stuck" or unresponsive, and risking rate-limit errors
+# that crash the script before your question is processed.
+# We cache the result in session_state, keyed by doc_id, so it only runs once
+# per uploaded document.
+if st.session_state.get("analysis_doc_id") != doc_id:
+    all_alerts, waiting_periods, exclusions = [], [], []
+    copayments, hidden_limits, llm_risk_scores = [], [], []
 
-st.markdown("""
-<div style="font-size:0.78rem;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;
-            color:#6868a8;margin-bottom:0.5rem;font-family:'JetBrains Mono',monospace">
-    Step 1 of 2 — Reading Policy Document
-</div>
-""", unsafe_allow_html=True)
-progress_bar = st.progress(0)
-status_slot  = st.empty()
+    st.markdown("""
+    <div style="font-size:0.78rem;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;
+                color:#6868a8;margin-bottom:0.5rem;font-family:'JetBrains Mono',monospace">
+        Step 1 of 2 — Reading Policy Document
+    </div>
+    """, unsafe_allow_html=True)
+    progress_bar = st.progress(0)
+    status_slot  = st.empty()
 
-PHASE1_STEPS = [
-    "Extracting policy structure...",
-    "Scanning for exclusions...",
-    "Identifying waiting periods...",
-    "Checking co-payment clauses...",
-    "Detecting hidden sub-limits...",
-    "Flagging critical risk alerts...",
-    "Scoring overall policy risk...",
-    "Finalising analysis...",
-]
+    PHASE1_STEPS = [
+        "Extracting policy structure...",
+        "Scanning for exclusions...",
+        "Identifying waiting periods...",
+        "Checking co-payment clauses...",
+        "Detecting hidden sub-limits...",
+        "Flagging critical risk alerts...",
+        "Scoring overall policy risk...",
+        "Finalising analysis...",
+    ]
 
-for i, chunk in enumerate(chunks):
-    step_label = PHASE1_STEPS[min(i, len(PHASE1_STEPS) - 1)]
+    for i, chunk in enumerate(chunks):
+        step_label = PHASE1_STEPS[min(i, len(PHASE1_STEPS) - 1)]
+        status_slot.markdown(
+            f'<div style="font-size:0.82rem;color:#5858888;font-family:\'JetBrains Mono\',monospace">'
+            f'{step_label}</div>',
+            unsafe_allow_html=True
+        )
+        try:
+            result = insurance_decoder(chunk)
+        except Exception as e:
+            # Don't let one failed chunk (e.g. a Groq rate-limit error) crash
+            # the whole analysis — skip it and keep going.
+            result = None
+            st.session_state["analysis_chunk_errors"] = (
+                st.session_state.get("analysis_chunk_errors", []) + [str(e)]
+            )
+        if result:
+            s = result.get("risk_score", 0)
+            if isinstance(s, (int, float)) and 0 <= s <= 100:
+                llm_risk_scores.append(s)
+            all_alerts.extend(result.get("danger_alerts", []))
+            waiting_periods.extend(result.get("waiting_periods", []))
+            exclusions.extend(result.get("exclusions", []))
+            copayments.extend(result.get("co_payment", []))
+            hidden_limits.extend(result.get("hidden_limits", []))
+        progress_bar.progress((i + 1) / len(chunks))
+
     status_slot.markdown(
-        f'<div style="font-size:0.82rem;color:#5858888;font-family:\'JetBrains Mono\',monospace">'
-        f'{step_label}</div>',
+        '<div style="font-size:0.82rem;color:#27ae60;font-family:\'JetBrains Mono\',monospace">'
+        'Analysis complete.</div>',
         unsafe_allow_html=True
     )
-    result = insurance_decoder(chunk)
-    if result:
-        s = result.get("risk_score", 0)
-        if isinstance(s, (int, float)) and 0 <= s <= 100:
-            llm_risk_scores.append(s)
-        all_alerts.extend(result.get("danger_alerts", []))
-        waiting_periods.extend(result.get("waiting_periods", []))
-        exclusions.extend(result.get("exclusions", []))
-        copayments.extend(result.get("co_payment", []))
-        hidden_limits.extend(result.get("hidden_limits", []))
-    progress_bar.progress((i + 1) / len(chunks))
+    import time; time.sleep(0.6)
+    progress_bar.empty()
+    status_slot.empty()
 
-status_slot.markdown(
-    '<div style="font-size:0.82rem;color:#27ae60;font-family:\'JetBrains Mono\',monospace">'
-    'Analysis complete.</div>',
-    unsafe_allow_html=True
-)
-import time; time.sleep(0.6)
-progress_bar.empty()
-status_slot.empty()
+    waiting_periods = deduplicate(waiting_periods)
+    exclusions      = deduplicate(exclusions)
+    copayments      = deduplicate(copayments)
+    hidden_limits   = deduplicate(hidden_limits)
+    all_alerts      = deduplicate(all_alerts)
 
-waiting_periods = deduplicate(waiting_periods)
-exclusions      = deduplicate(exclusions)
-copayments      = deduplicate(copayments)
-hidden_limits   = deduplicate(hidden_limits)
-all_alerts      = deduplicate(all_alerts)
+    if not llm_risk_scores and not exclusions and not waiting_periods and not all_alerts:
+        st.error("Could not extract data from the policy. Please check that the PDF has readable text.")
+        st.stop()
 
-if not llm_risk_scores and not exclusions and not waiting_periods and not all_alerts:
-    st.error("Could not extract data from the policy. Please check that the PDF has readable text.")
-    st.stop()
+    llm_avg_risk = int(sum(llm_risk_scores) / len(llm_risk_scores)) if llm_risk_scores else 50
 
-llm_avg_risk = int(sum(llm_risk_scores) / len(llm_risk_scores)) if llm_risk_scores else 50
+    # Auto-extract policy parameters from LLM output
+    extracted_copay       = parse_copay_pct(copayments)
+    extracted_room_rent   = parse_room_rent(hidden_limits)
+    extracted_deductible  = parse_deductible(hidden_limits)
 
-# Auto-extract policy parameters from LLM output
-extracted_copay       = parse_copay_pct(copayments)
-extracted_room_rent   = parse_room_rent(hidden_limits)
-extracted_deductible  = parse_deductible(hidden_limits)
+    st.session_state["analysis_doc_id"] = doc_id
+    st.session_state["analysis_cache"] = {
+        "all_alerts": all_alerts,
+        "waiting_periods": waiting_periods,
+        "exclusions": exclusions,
+        "copayments": copayments,
+        "hidden_limits": hidden_limits,
+        "llm_avg_risk": llm_avg_risk,
+        "extracted_copay": extracted_copay,
+        "extracted_room_rent": extracted_room_rent,
+        "extracted_deductible": extracted_deductible,
+    }
+else:
+    # Already analysed this document in a previous run — reuse cached results
+    # instead of hitting the LLM again.
+    cached = st.session_state["analysis_cache"]
+    all_alerts           = cached["all_alerts"]
+    waiting_periods      = cached["waiting_periods"]
+    exclusions           = cached["exclusions"]
+    copayments           = cached["copayments"]
+    hidden_limits        = cached["hidden_limits"]
+    llm_avg_risk         = cached["llm_avg_risk"]
+    extracted_copay      = cached["extracted_copay"]
+    extracted_room_rent  = cached["extracted_room_rent"]
+    extracted_deductible = cached["extracted_deductible"]
 
 section("Policy Summary")
 
@@ -1151,9 +1204,16 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Initialise chat history
-if "chat_history" not in st.session_state or st.session_state.get("chat_doc_id") != doc_id:
+if "chat_history" not in st.session_state:
     st.session_state["chat_history"] = []
-    st.session_state["chat_doc_id"]  = doc_id
+
+if st.session_state.get("chat_doc_id") != doc_id:
+    old_doc = st.session_state.get("chat_doc_id")
+    if old_doc:
+        reset_chat_engine(old_doc)
+
+    st.session_state["chat_doc_id"] = doc_id
+    st.session_state["chat_history"] = []
 
 rag_ready = st.session_state.get("rag_ready", False)
 
@@ -1200,9 +1260,18 @@ else:
             )
 
     # Input box
+    # NOTE: don't pass `value=` alongside `key=` here — Streamlit only keeps
+    # a widget's live typed value across a rerun triggered by that same
+    # widget. A rerun triggered by a *different* widget (the Ask button)
+    # falls back to re-evaluating `value=`, wiping whatever was typed right
+    # before Ask reads it. Instead, seed session_state directly (only when
+    # a suggested question needs to be injected) before the widget exists.
+    pending = st.session_state.pop("pending_question", None)
+    if pending is not None:
+        st.session_state["qa_input"] = pending
+
     user_input = st.text_input(
         "Ask a question about your policy",
-        value=st.session_state.pop("pending_question", ""),
         placeholder="e.g. Does this policy cover maternity? What is the ICU room rent limit?",
         label_visibility="collapsed",
         key="qa_input",
@@ -1214,6 +1283,7 @@ else:
     with col_clear:
         if st.button("Clear", use_container_width=True):
             st.session_state["chat_history"] = []
+            reset_chat_engine(doc_id)
             st.rerun()
 
     if ask_clicked and user_input.strip():
@@ -1222,17 +1292,30 @@ else:
         with st.spinner("Retrieving relevant clauses and generating answer..."):
             try:
                 chunks_retrieved = retrieve(question, doc_id)
+
+                if not chunks_retrieved:
+                    st.warning("I couldn't find relevant information in this policy.")
+                    st.stop()
                 answer = answer_question(
-                    question,
-                    chunks_retrieved,
+                    question=question,
+                    chunks=chunks_retrieved,
+                    doc_id=doc_id,
                     history=st.session_state["chat_history"],
                 )
                 st.session_state["chat_history"].append({"role": "user",      "content": question})
                 st.session_state["chat_history"].append({"role": "assistant", "content": answer})
+                st.session_state.pop("qa_error", None)
             except Exception as e:
-                st.error(f"Q&A failed: {e}")
+                # Keep the question so the user doesn't lose it, and keep the
+                # error around a rerun (st.rerun() below would otherwise wipe
+                # an inline st.error() before it's ever visible).
+                st.session_state["qa_error"] = str(e)
+                st.session_state["pending_question"] = question
 
         st.rerun()
+
+    if st.session_state.get("qa_error"):
+        st.error(f"Q&A failed: {st.session_state['qa_error']}")
 
 # Footer
 st.markdown("""

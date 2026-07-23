@@ -4,21 +4,31 @@ Model: llama3-8b-8192 (free, fast, good for structured extraction)
 """
 
 import json
+import os
 import re
 import streamlit as st
 from groq import Groq
 
 # ── Client ─────────────────────────────────────────────────────────────────────
 
-def _client() -> Groq:
-    try:
-        api_key = st.secrets["GROQ_API_KEY"]
-    except Exception:
+def _get_groq_api_key() -> str:
+    """Read GROQ_API_KEY from env vars (Replit Secrets) first, then st.secrets."""
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        try:
+            api_key = st.secrets["GROQ_API_KEY"]
+        except Exception:
+            api_key = None
+    if not api_key:
         raise RuntimeError(
-            "GROQ_API_KEY not found. Add it to .streamlit/secrets.toml locally "
-            "or to the Secrets section in Streamlit Cloud."
+            "GROQ_API_KEY not found. Add it as a Replit Secret, or to "
+            ".streamlit/secrets.toml locally."
         )
-    return Groq(api_key=api_key)
+    return api_key
+
+
+def _client() -> Groq:
+    return Groq(api_key=_get_groq_api_key())
 
 
 MAX_SINGLE = 6000
