@@ -1,30 +1,28 @@
-## LegalX - Insurance Summarizer
+## Overview of the problem
+Legal documentation can be a complicated and time-consuming process, especially for individuals and small
+businesses who may not have access to legal resources. In addition, the language and jargon used in legal documents
+can be difficult for non-lawyers to understand, which can lead to errors and misunderstandings
+
+## Objective
+To simplify legal documentation by automatically decoding legal documents in plain language and using easy-to-understand terms
+
+## LegalX - AI-powered Legal Documentation Assistant
 A Streamlit app that lets a user upload a health insurance policy PDF and:
 - Get a plain-English summary and risk score (waiting periods, co-payments, hidden limits, exclusions) via Groq's LLM API.
 - Chat with the document using a RAG pipeline (LlamaIndex + local HuggingFace embeddings + in-memory ChromaDB) so answers are grounded in the retrieved policy text.
 
-## Problem
-68% of Indian policyholders do not fully understand policy documents, leading to claim rejections and financial loss.
-
 ## Features
-- Personalized Risk Profiling
-- Age-based analysis
-- Policy duration analysis
-- Family coverage evaluation
-- Insurance Vulnerability Score (Core Feature)
-- Indicates financial exposure level
+ 1. User-friendly interface for inputting relevant information such as their policy cover, potential diseases, age, etc for a Personalized Risk Profiling
+ 2. Ability to customize legal documents based on the specific needs of the user.
+ 3. Insurance Vulnerability Score.
+ 4. Indicates financial exposure level
+ 5. Identifies top risk drivers and “What’s Not Covered”
+ 6. High-Risk Clauses, Detects waiting periods, Identifies co-payment clauses, Flags disease-specific exclusions
 
-- Identifies top risk drivers
-- Helps users compare policy strength
-- Transparency Report
-- “What’s Not Covered”
-- High-Risk Clauses
-  
-- Clause Intelligence Extraction
-- Detects waiting periods
-- Identifies co-payment clauses
-- Extracts sub-limits and caps
-- Flags disease-specific exclusions
+## Impact 
+Impact: The proposed solution can greatly benefit individuals and small businesses in India, who often
+face challenges with legal documentation due to limited access to legal resources. By simplifying legal documentation,
+this solution can potentially save time and reduce financial exposure during crisis
 
 ## Snapshots of Protoype
 <img width="2204" height="928" alt="image" src="https://github.com/user-attachments/assets/a68be49b-7a39-4338-8540-2c087862a489" />
